@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# ============================================================================
+# gputest —— GPU 压测工具的统一 CLI 入口
+#
+# 目的：在**任意目录**直接敲 `gputest ...`，不用记工具安装路径，也不用 cd 过去。
+# 本脚本只做三件事：定位工具根目录、分发子命令、把参数透传给原有脚本；
+# 压测 / 采样 / 绘图的实现仍然全在 run_test.sh 与 summary_monitor/ 里，不重复一份。
+#
+#   用户给的相对路径一律按**当前目录**解析（子命令不会 cd 走），
+#   工具自身的依赖（ports.json / summary_monitor / *.py）按**工具目录**定位。
+#
+# 用法见 `gputest help` 或 `gputest <命令> --help`。
+# ============================================================================
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="gputest"
+
+# ---------------------------------------------------------------- 自身定位 --
+# 软链安装时逐跳 readlink 解析到真实文件，保证从 ~/.local/bin 之类的软链调用
+# 也能找到工具目录（bash 4.2 不保证 readlink -f，这里自己走一遍）。
+_resolve_self() {
+  local src=$1 dir
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+    src=$(readlink "$src")
+    case $src in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)" "$(basename "$src")"
+}
+
+SELF=$(_resolve_self "${BASH_SOURCE[0]}")
+SELF_DIR=$(dirname "$SELF")
+
+# 工具根目录：优先 GPUTEST_HOME，否则用本文件的上两级（bin/..）。
+if [ -n "${GPUTEST_HOME:-}" ]; then
+  TOOL_ROOT=$GPUTEST_HOME
+elif [ -f "$SELF_DIR/../run_test.sh" ]; then
+  TOOL_ROOT=$(cd -P "$SELF_DIR/.." && pwd)
+else
+  TOOL_ROOT=$SELF_DIR
+fi
+
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 || command -v python || true)}
+
+die() { printf '❌ %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+require_tool_root() {
+  [ -f "$TOOL_ROOT/run_test.sh" ] || die "找不到工具目录（$TOOL_ROOT 下没有 run_test.sh）；可用 GPUTEST_HOME 指定"
+}
+
+require_python() {
+  [ -n "$PYTHON_BIN" ] || die "找不到 python3，无法运行采样/绘图"
+}
+
+# ---------------------------------------------------------------- 帮助文本 --
+usage() {
+  cat <<'EOF'
+gputest —— 一键压测 + 指标采集 + 曲线出图（GPU 版）
+
+用法:
+  gputest <命令> [参数...]
+  gputest <jmx> <结果目录> <容器名> <线程数> <秒数> [选项...]   # 省略 run 的简写
+
+命令:
+  run        一键压测：改配置(可选) → 施压 → 采样 → 出图（= run_test.sh）
+  config     只改 server_config.json 并等端口就绪（不压测，= apply_server_config.sh）
+  monitor    只采样不压测，Ctrl-C 停止后自动出图
+  plot       用已有 metrics.csv 重新出图（只写 PNG）
+  services   列出 ports.json 里的 服务名 → 端口
+  doctor     环境自检：python3 / docker / nvidia-smi / jmeter / librsvg
+  install    把 gputest 软链到 PATH 目录，任意目录可用
+  version    版本号
+  help       这份帮助
+
+常用示例:
+  # 压测（服务名决定 JMX 端口）
+  gputest run ./yc.jmx ./result hexocr-hexocr-1 3 900 --service fs
+
+  # 一条命令：workers=2/threads=4 → 重启 → 就绪 → 压 900 秒
+  gputest run ./yc.jmx ./result bsocr-container 10 900 --service bsocr \
+    --server-config ./server_config.json --config-workers 2 --config-threads 4
+
+  # 预热 120s + 正式 600s，A 调用 B 两个容器画进同一批图
+  gputest run ./yc.jmx ./result svc-a 10 600 --service fs --warmup 120 \
+    --monitor-containers svc-a,svc-b
+
+  # 只采样 60 秒（自动出图到 ./monitor_<容器>_<时间>/）
+  gputest monitor --container svc-a --duration 60
+
+  # 只重画图
+  gputest plot ./results/run_xxx/metrics.csv
+
+  # 安装到 PATH（默认 ~/.local/bin）
+  gputest install
+
+各命令的完整选项:
+  gputest run --help      gputest config --help
+  gputest monitor --help  gputest plot --help
+
+环境变量:
+  GPUTEST_HOME   工具目录（默认由 gputest 自身位置推导）
+  JMETER         jmeter 可执行文件路径（未设置时自动查找常见位置）
+  WARMUP / SERVICE / PORT / MONITOR_* / CONFIG_*   同 run_test.sh 的默认值
+EOF
+}
+
+run_usage() {
+  cat <<'EOF'
+gputest run —— 一键压测
+
+用法:
+  gputest run <jmx路径> <结果目录> <容器名> <线程数> <正式测量秒数> [选项...]
+
+位置参数（相对路径按当前目录解析）:
+  jmx路径        JMeter 模板（不会被改写；运行副本是结果目录里的 plan.jmx）
+  结果目录       结果根目录，每次运行在其中新建 run_<容器>_<时间>_<随机串>/
+  容器名         要压测/监控的容器
+  线程数         JMeter 线程数（正整数，与服务配置的 workers/threads 无关）
+  正式测量秒数   不含预热的正式测量时长（正整数）
+
+必传选项:
+  --service <名>              服务名（ports.json 的 key），决定 JMX 端口
+
+可选:
+  --port <端口>               1–65535，优先级最高（只改运行副本）
+  --ports-config <文件>       换一份端口配置（本地路径）
+  --warmup <秒>               预热时长，非负整数，默认 0
+  --monitor-containers a,b    采哪些容器，默认等于压测容器
+  --monitor-interval <秒>     采样目标间隔，默认 0.3
+  --monitor-timeout <秒>      单轮采样 deadline，默认 2
+  --server-config <文件>      本地 server_config.json；与下面两项一起给出才改配置
+  --config-workers <整数>     写进服务配置的 workers
+  --config-threads <整数>     写进服务配置的 threads
+  --config-target-path <路径> 容器内目标路径，默认 /hexapp/ai-<服务名>-serving/conf/server_config.json
+  --config-wait <秒>          重启后等端口就绪的上限，默认 30；0 表示不等
+  --config-settle <秒>        就绪后再稳定几秒，默认 5
+  -h, --help                  显示这份帮助
+
+完整说明见 README.md。
+EOF
+}
+
+monitor_usage() {
+  cat <<'EOF'
+gputest monitor —— 只采样，不压测
+
+用法:
+  gputest monitor --container a[,b] [--output-dir DIR] [--interval 0.3] [--timeout 2]
+                  [--duration 秒] [--warmup 秒]
+
+  --container,-c   容器名，可重复给；一个参数里逗号分隔多个也算（合并进一份 CSV）
+  --output-dir,-o  输出目录，默认 ./monitor_<容器>_<时间>
+  --interval       采样目标间隔（秒），默认 0.3
+  --timeout        单轮采样 deadline（秒），默认 2
+  --duration,-d    采样时长；不给就一直采到 Ctrl-C
+  --warmup         配合压测的预热秒数（读 JMeter 的 measurement_window.json），默认 0
+
+采样结束后自动在 <输出目录>/plots 出图。
+EOF
+}
+
+plot_usage() {
+  cat <<'EOF'
+gputest plot —— 用已有 CSV 重新出图
+
+用法:
+  gputest plot <metrics.csv> [--output-dir DIR]
+
+  --output-dir,-o  出图目录，默认 <csv 所在目录>/plots
+  只写 PNG（cpu / vram / vram_utilization / memory / overview）；缺 librsvg/Cairo 会明确报错。
+EOF
+}
+
+config_usage() {
+  cat <<'EOF'
+gputest config —— 只改服务配置并等就绪（不压测）
+
+用法:
+  gputest config <server_config.json> <容器名> <服务名> <workers> <threads> [选项]
+
+  --target-path <路径>   容器内绝对路径（默认 /hexapp/ai-<服务名>-serving/conf/server_config.json）
+  --wait <秒>            等端口就绪上限，默认 30；0 表示不等
+  --settle <秒>          就绪后再稳定几秒，默认 5
+  --port <端口>          覆盖端口（否则查 ports.json[服务名]）
+  --ports-config <文件>  换一份端口配置
+  --run-dir <目录>       额外归档 server_config.json / config_change.json
+
+会重启容器，不要在压测进行中执行。
+EOF
+}
+
+services_usage() {
+  cat <<'EOF'
+gputest services —— 列出服务名 → 端口
+
+用法:
+  gputest services [--ports-config <文件>]
+EOF
+}
+
+install_usage() {
+  cat <<'EOF'
+gputest install —— 安装到 PATH，任意目录可用
+
+用法:
+  gputest install [--prefix DIR] [--copy] [--update-path] [--uninstall]
+
+  --prefix DIR     装到指定目录，默认自动选（优先已在 PATH 上的 ~/.local/bin）
+  --copy           复制整个工具目录到 DIR/gputest.d（不依赖原目录）
+  --update-path    把目录写进 ~/.bashrc（幂等，仅当它不在 PATH 上时）
+  --uninstall      移除已安装的文件
+EOF
+}
+
+# ---------------------------------------------------------------- 子命令: run --
+cmd_run() {
+  require_tool_root
+  case "${1:-}" in
+    -h|--help|help) run_usage; return 0 ;;
+  esac
+  # exec：保留调用方 PID，Ctrl-C / SIGTERM 直接到达负责收尾的进程
+  exec bash "$TOOL_ROOT/run_test.sh" "$@"
+}
+
+# ------------------------------------------------------------- 子命令: config --
+cmd_config() {
+  require_tool_root
+  case "${1:-}" in
+    -h|--help|help) config_usage; return 0 ;;
+  esac
+  [ -f "$TOOL_ROOT/apply_server_config.sh" ] || die "找不到 apply_server_config.sh"
+  [ "$#" -ge 5 ] || { config_usage >&2; die "改配置需要 5 个位置参数"; }
+  exec bash "$TOOL_ROOT/apply_server_config.sh" "$@"
+}
+
+# ------------------------------------------------------------ 子命令: monitor --
+cmd_monitor() {
+  require_tool_root
+  require_python
+  local containers=() output_dir="" interval="" timeout="" duration="" warmup=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help|help) monitor_usage; return 0 ;;
+      --container|-c)
+        [ "$#" -ge 2 ] || die "$1 缺少参数"; containers+=("$2"); shift 2 ;;
+      --container=*) containers+=("${1#*=}"); shift ;;
+      --output-dir|-o)
+        [ "$#" -ge 2 ] || die "$1 缺少参数"; output_dir=$2; shift 2 ;;
+      --output-dir=*) output_dir=${1#*=}; shift ;;
+      --interval)
+        [ "$#" -ge 2 ] || die "--interval 缺少参数"; interval=$2; shift 2 ;;
+      --timeout)
+        [ "$#" -ge 2 ] || die "--timeout 缺少参数"; timeout=$2; shift 2 ;;
+      --duration|-d)
+        [ "$#" -ge 2 ] || die "$1 缺少参数"; duration=$2; shift 2 ;;
+      --duration=*) duration=${1#*=}; shift ;;
+      --warmup)
+        [ "$#" -ge 2 ] || die "--warmup 缺少参数"; warmup=$2; shift 2 ;;
+      *) die "monitor 未知选项: $1（见 gputest monitor --help）" ;;
+    esac
+  done
+  [ "${#containers[@]}" -gt 0 ] || { monitor_usage >&2; die "monitor 需要至少一个 --container"; }
+
+  if [ -z "$output_dir" ]; then
+    local tag=${containers[0]//,/+}
+    tag=${tag//[^A-Za-z0-9_.+-]/_}
+    output_dir="./monitor_${tag}_$(date +%Y%m%d_%H%M%S)"
+  fi
+
+  local args=() c
+  for c in "${containers[@]}"; do args+=(--container "$c"); done
+  args+=(--output-dir "$output_dir")
+  [ -n "$interval" ] && args+=(--interval "$interval")
+  [ -n "$timeout" ]  && args+=(--timeout "$timeout")
+  [ -n "$duration" ] && args+=(--duration "$duration")
+  [ -n "$warmup" ]   && args+=(--warmup "$warmup")
+
+  say "📈 采样容器: ${containers[*]}"
+  say "📁 输出目录: $output_dir"
+  if [ -n "$duration" ]; then say "⏱ 时长: ${duration}s"; else say "⏱ 时长: 一直采到 Ctrl-C"; fi
+  # exec 让 Ctrl-C / SIGTERM 直达采样进程，它负责写 monitor_status.json 并出图
+  exec "$PYTHON_BIN" -u "$TOOL_ROOT/summary_monitor/collect_metrics.py" "${args[@]}"
+}
+
+# --------------------------------------------------------------- 子命令: plot --
+cmd_plot() {
+  require_tool_root
+  require_python
+  local csv="" output_dir=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help|help) plot_usage; return 0 ;;
+      --output-dir|-o)
+        [ "$#" -ge 2 ] || die "$1 缺少参数"; output_dir=$2; shift 2 ;;
+      --output-dir=*) output_dir=${1#*=}; shift ;;
+      -*) die "plot 未知选项: $1" ;;
+      *)  [ -z "$csv" ] || die "plot 只接受一个 CSV 路径"; csv=$1; shift ;;
+    esac
+  done
+  [ -n "$csv" ] || { plot_usage >&2; die "plot 需要 metrics.csv 路径"; }
+  [ -f "$csv" ] || die "CSV 不存在: $csv"
+  if [ -z "$output_dir" ]; then
+    output_dir="$(cd "$(dirname "$csv")" && pwd)/plots"
+  fi
+  exec "$PYTHON_BIN" "$TOOL_ROOT/summary_monitor/plot_metrics.py" "$csv" --output-dir "$output_dir"
+}
+
+# ----------------------------------------------------------- 子命令: services --
+cmd_services() {
+  require_tool_root
+  require_python
+  local ports_config=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help|help) services_usage; return 0 ;;
+      --ports-config)
+        [ "$#" -ge 2 ] || die "--ports-config 缺少参数"; ports_config=$2; shift 2 ;;
+      --ports-config=*) ports_config=${1#*=}; shift ;;
+      *) die "services 未知选项: $1" ;;
+    esac
+  done
+  local cfg=${ports_config:-$TOOL_ROOT/ports.json}
+  [ -f "$cfg" ] || die "端口配置不存在: $cfg"
+  "$PYTHON_BIN" - "$cfg" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    config = json.load(stream)
+if not isinstance(config, dict) or not config:
+    sys.exit("端口配置为空或格式不对: {}".format(path))
+width = max(len(str(name)) for name in config)
+print("{:<{w}}  {}".format("服务名", "端口", w=width))
+print("{}  {}".format("-" * width, "-" * 6))
+for name in sorted(config):
+    print("{:<{w}}  {}".format(name, config[name], w=width))
+print("\n共 {} 个服务（{}）".format(len(config), path))
+PY
+}
+
+# ------------------------------------------------------------- 子命令: doctor --
+cmd_doctor() {
+  require_tool_root
+  local failures=0
+
+  ok()   { printf '✅ %s\n' "$*"; }
+  bad()  { printf '❌ %s\n' "$*"; failures=$((failures + 1)); }
+
+  say "🩺 gputest $VERSION 环境自检（工具目录: $TOOL_ROOT）"
+  say ""
+
+  if [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
+    ok "python3 $("$PYTHON_BIN" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')  $PYTHON_BIN"
+  else
+    bad "python3 3.7+ 未找到或版本过低"
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+      ok "docker daemon 可访问（$(docker version --format '{{.Server.Version}}' 2>/dev/null)）"
+    else
+      bad "docker daemon 不可访问（当前用户在 docker 组里吗？采样依赖 docker top）"
+    fi
+  else
+    bad "docker CLI 未找到"
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    ok "nvidia-smi $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  else
+    bad "nvidia-smi 未找到（显存 / 占卡进程的唯一来源）"
+  fi
+
+  if [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import ctypes.util
+import sys
+sys.exit(0 if ctypes.util.find_library('rsvg-2') and ctypes.util.find_library('cairo') else 1)
+PY
+  then
+    ok "librsvg / Cairo 可绑定（PNG 出图）"
+  else
+    bad "绑定不到 librsvg / Cairo，出图会失败（装 librsvg2 / cairo）"
+  fi
+
+  local jm=${JMETER:-}
+  [ -n "$jm" ] || jm=$(command -v jmeter 2>/dev/null || true)
+  if [ -z "$jm" ]; then
+    local cand
+    for cand in /data/aitest/tools/apache-jmeter-*/bin/jmeter \
+                "$TOOL_ROOT"/../tools/apache-jmeter-*/bin/jmeter \
+                "$TOOL_ROOT"/../*/apache-jmeter-*/bin/jmeter \
+                /opt/apache-jmeter-*/bin/jmeter /usr/local/apache-jmeter-*/bin/jmeter; do
+      if [ -x "$cand" ]; then jm=$cand; break; fi
+    done
+  fi
+  if [ -n "$jm" ]; then
+    ok "jmeter $jm"
+  else
+    bad "未找到 jmeter（用 JMETER=/path/to/jmeter 或把 bin 加进 PATH）"
+  fi
+
+  if command -v gputest >/dev/null 2>&1; then
+    ok "gputest 已在 PATH 上（$(command -v gputest)）"
+  else
+    local installed_at=""
+    local cand
+    for cand in "${HOME:-/root}/.local/bin/gputest" "${HOME:-/root}/bin/gputest"; do
+      [ -x "$cand" ] && installed_at=$cand && break
+    done
+    if [ -n "$installed_at" ]; then
+      printf '⚠️ 已安装（%s），但当前 shell 的 PATH 未包含它；新开终端或 source ~/.bashrc 后即可直接用 gputest\n' "$installed_at"
+    else
+      printf '⚠️ 还没装到 PATH 上；执行 %s install 后任意目录可用\n' "$SELF"
+    fi
+  fi
+
+  say ""
+  if [ "$failures" -eq 0 ]; then
+    say "🎉 全部就绪，可以直接 gputest run ..."
+    return 0
+  fi
+  printf '❌ 有 %d 项不满足，见 README「环境要求」\n' "$failures" >&2
+  return 1
+}
+
+# ------------------------------------------------------------ 子命令: install --
+cmd_install() {
+  require_tool_root
+  case "${1:-}" in
+    -h|--help|help) install_usage; return 0 ;;
+  esac
+  exec bash "$TOOL_ROOT/install.sh" "$@"
+}
+
+# -------------------------------------------------------------------- 分发 --
+cmd=${1:-}
+case "$cmd" in
+  ""|help|--help|-h) usage; exit 0 ;;
+  version|--version|-V) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+  run)                    shift; cmd_run "$@" ;;
+  config|cfg)             shift; cmd_config "$@" ;;
+  monitor|watch|collect)  shift; cmd_monitor "$@" ;;
+  plot|render)            shift; cmd_plot "$@" ;;
+  services|ports)         shift; cmd_services "$@" ;;
+  doctor|check)           shift; cmd_doctor "$@" ;;
+  install)                shift; cmd_install "$@" ;;
+  *)
+    # 兼容旧习惯：直接 5 个位置参数（jmx 结果目录 容器 线程 秒数）等价于 run
+    if [ "$#" -ge 5 ] && { [ -f "$1" ] || [[ "$1" == *.jmx ]]; }; then
+      cmd_run "$@"
+    fi
+    die "未知命令: $cmd（gputest help 看可用命令）" ;;
+esac

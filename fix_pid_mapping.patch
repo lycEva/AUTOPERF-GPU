@@ -1,0 +1,126 @@
+--- a/update_jmx_pid.py
++++ b/update_jmx_pid.py
+@@ -14,43 +14,64 @@
+     return sorted(pids)
+ 
+ 
+-# ===== 获取docker worker PID =====
+-def get_worker_pids(container):
+-    cmd = f"docker top {container} -eo pid,ppid,cmd | grep gunicorn"
+-    
++# ===== 容器进程树辅助 =====
++# 不再是所有服务都用 gunicorn：ocr-serving / uvicorn / 自研二进制都见过，
++# 所以这里只按「进程树」取业务进程，不绑定进程名。
++HELPER_CMDS = ("bash", "sh", "tini", "tail", "sleep", "grep", "cat", "pause", "docker-init")
++
++
++def _is_helper(cmd):
++    """入口脚本、常驻 shell、sleep/tini 之类的辅助进程，不算业务 worker。"""
++    base = cmd.strip().split()[0] if cmd.strip() else ""
++    name = base.rsplit("/", 1)[-1]
++    return name in HELPER_CMDS
++
++
++def get_processes(container):
++    """返回容器内进程列表 [(pid, ppid, cmd)]，拿不到就返回 []。"""
++    cmd = f"docker top {container} -eo pid,ppid,cmd"
++
+     try:
+-        output = subprocess.check_output(cmd, shell=True).decode().strip().splitlines()
++        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+     except subprocess.CalledProcessError:
+         return []
+ 
+     processes = []
+-    for line in output:
+-        parts = line.split()
+-        if len(parts) >= 2:
+-            pid = parts[0]
+-            ppid = parts[1]
+-            processes.append((pid, ppid))
++    for line in output.strip().splitlines()[1:]:
++        parts = line.split(None, 2)
++        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
++            processes.append((parts[0], parts[1], parts[2] if len(parts) > 2 else ""))
++    return processes
++
+ 
++# ===== 获取容器 worker PID =====
++def get_worker_pids(container):
++    processes = get_processes(container)
+     if not processes:
+         return []
+ 
+-    # 所有 gunicorn 的 pid
+-    pid_set = set(pid for pid, _ in processes)
++    # 优先只看业务进程（排除 bash/tini/sleep 等），排完为空才退回全量
++    serving = [p for p in processes if not _is_helper(p[2])]
++    pool = serving or processes
++
++    pid_set = set(pid for pid, _, _ in pool)
+ 
+-    # 找 master：它的 ppid 不在 gunicorn pid 集合里
++    # 找 master：它的 ppid 不在 pool 的 pid 集合里
+     master_pid = None
+-    for pid, ppid in processes:
++    for pid, ppid, _ in pool:
+         if ppid not in pid_set:
+             master_pid = pid
+             break
+ 
+-    if not master_pid:
+-        return []
+-
+-    # 找 worker：ppid == master_pid
+-    worker_pids = [pid for pid, ppid in processes if ppid == master_pid]
+-
+-    return sorted(worker_pids)
++    if master_pid:
++        # 找 worker：ppid == master_pid
++        worker_pids = [pid for pid, ppid, _ in pool if ppid == master_pid]
++        if worker_pids:
++            return sorted(worker_pids)
++
++    # 没有清晰的 master/worker 结构（例如 ocr-serving 多进程平铺）：
++    # 直接返回 pool 里的全部 pid，由调用方判断够不够。
++    return sorted(p for p, _, _ in pool)
+ 
+ 
+ # ===== 替换 PID =====
+@@ -92,13 +113,17 @@
+         new_pids = get_worker_pids(container)
+ 
+         if len(new_pids) < len(old_pids):
+-            raise Exception("❌ Docker PID数量不足")
+-
+-        pid_map = dict(zip(old_pids, new_pids))
+-
+-        print("🔗 PID映射:")
+-        for k, v in pid_map.items():
+-            print(f"{k} → {v}")
++            # GPU_TOOL 已移除 ServerAgent/PerfMon，JMX 里的 pid= / grep <pid> 只是历史遗留。
++            # PID 数量不足不再中断压测：只告警并跳过替换，监控侧（summary_monitor）会自行解析 PID。
++            print(f"⚠️ 容器 {container} 只解析到 {len(new_pids)} 个业务 PID"
++                  f"（JMX 里需要 {len(old_pids)} 个），跳过 PID 替换，继续压测")
++            pid_map = {}
++        else:
++            pid_map = dict(zip(old_pids, new_pids))
++
++            print("🔗 PID映射:")
++            for k, v in pid_map.items():
++                print(f"{k} → {v}")
+     else:
+         # GPU_TOOL 已去掉 ServerAgent/PerfMon，JMX 中不再带 pid= 引用，
+         # 进程 PID 由 summary_monitor/collect_metrics.py 在采样时自行解析
+--- a/run_test.sh
++++ b/run_test.sh
+@@ -154,7 +154,8 @@
+ if [ -n "$UPDATE_PY" ]; then
+   echo "🛠 更新JMX PID映射: $UPDATE_PY"
+   "$PYTHON_BIN" "$UPDATE_PY" "$PLAN" "$CONTAINER" "$THREADS" "$TOTAL_DURATION" || {
+-    echo "❌ JMX更新失败" >&2; exit 1; }
++    # PID 映射是 legacy 步骤（GPU 版已无 ServerAgent/PerfMon），失败只告警不中断压测
++    echo "⚠️ JMX PID 映射失败，跳过该步骤继续压测" >&2; }
+ else
+   echo "⚠️ 未找到 update_jmx_pid.py，跳过 PID 替换" >&2
+ fi
