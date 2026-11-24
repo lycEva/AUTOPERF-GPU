@@ -22,7 +22,7 @@
 
 ### 1. 放好工具目录
 
-工具可以放在任何位置（本机是 `/mnt/ssd/nlp/wdc/xncs/GPU_TOOL`）。整目录拷过去即可，不需要编译、不需要 pip：
+工具可以放在任何位置（例如 `/opt/GPU_TOOL`、`~/tools/GPU_TOOL`）。整目录拷过去即可，不需要编译、不需要 pip：
 
 ```bash
 git clone https://github.com/lycEva/AUTOPERF-GPU.git GPU_TOOL      # 或压缩包：tar xf GPU_TOOL.tar.gz
@@ -60,8 +60,8 @@ bash install.sh
 默认软链到 `~/.local/bin`，同时提供 `gputest` 和别名 `gpu-test`：
 
 ```
-🔗 /data/wdj/.local/bin/gputest -> /mnt/ssd/nlp/wdc/xncs/GPU_TOOL/bin/gputest
-🔗 /data/wdj/.local/bin/gpu-test -> /mnt/ssd/nlp/wdc/xncs/GPU_TOOL/bin/gputest
+🔗 ~/.local/bin/gputest -> <工具目录>/bin/gputest
+🔗 ~/.local/bin/gpu-test -> <工具目录>/bin/gputest
 ```
 
 | 装法 | 命令 | 适用 |
@@ -90,7 +90,7 @@ bash install.sh --update-path && source ~/.bashrc
 ### 不安装也能用
 
 ```bash
-bash /path/to/GPU_TOOL/run_test.sh ./yc.jmx ./result <容器> 10 900 --service fs
+bash /path/to/GPU_TOOL/run_test.sh ./yc.jmx ./result <容器> 10 900 --service <服务名>
 # 或指定工具目录后直接用 CLI
 GPUTEST_HOME=/path/to/GPU_TOOL /path/to/GPU_TOOL/bin/gputest doctor
 ```
@@ -106,7 +106,7 @@ GPUTEST_HOME=/path/to/GPU_TOOL /path/to/GPU_TOOL/bin/gputest doctor
 gputest --version
 gputest doctor      # 环境自检：python3 / docker / nvidia-smi / jmeter / librsvg
 gputest services    # 列出服务名 → 端口
-gputest run ./yc.jmx ./result hexocr-hexocr-1 3 900 --service fs
+gputest run ./yc.jmx ./result svc-a 3 900 --service svc-a
 ```
 
 | 命令 | 作用 |
@@ -131,17 +131,17 @@ gputest run ./yc.jmx ./result hexocr-hexocr-1 3 900 --service fs
 
 ```bash
 # 1) 只压测：按服务名取端口改写 JMX
-gputest run ./yc.jmx ./result hexocr-hexocr-1 3 900 --service fs
+gputest run ./yc.jmx ./result svc-a 3 900 --service svc-a
 
 # 2) 改配置 + 压测（一条命令）：workers=2 / threads=4 → 重启 → 等就绪 → 压 900 秒
-gputest run ./yc.jmx ./result bsocr-container 10 900 --service bsocr \
+gputest run ./yc.jmx ./result svc-b 10 900 --service svc-b \
   --server-config ./server_config.json --config-workers 2 --config-threads 4
 
 # 3) 预热 120 秒 + 正式 600 秒
-gputest run ./yc.jmx ./result hexocr-hexocr-1 3 600 --service fs --warmup 120
+gputest run ./yc.jmx ./result svc-a 3 600 --service svc-a --warmup 120
 
 # 4) A 调用 B：压测 A，同时把 A、B 画进同一批图
-gputest run ./yc.jmx ./result svc-a 10 900 --service fs --monitor-containers svc-a,svc-b
+gputest run ./yc.jmx ./result svc-a 10 900 --service svc-a --monitor-containers svc-a,svc-b
 ```
 
 ```bash
@@ -188,7 +188,7 @@ gputest run <jmx路径> <结果目录> <容器名> <JMeter线程数> <正式测�
 - 服务起得慢就加大 `--config-wait`（如 180）。只想改配置、不压测时：
 
 ```bash
-bash apply_server_config.sh ./server_config.json bsocr-container bsocr 2 4 \
+bash apply_server_config.sh ./server_config.json svc-b svc-b 2 4 \
   --wait 120 --target-path /opt/app/conf/server_config.json
 ```
 
@@ -261,12 +261,12 @@ gputest plot ./monitor/metrics.csv
 
 ```bash
 # 场景 1：两个无关服务分别压测 → 各用独立结果目录
-gputest run ./a.jmx ./results/a svc-a 10 900 --service fs &
-gputest run ./b.jmx ./results/b svc-b 10 900 --service fs &
+gputest run ./a.jmx ./results/a svc-a 10 900 --service svc-a &
+gputest run ./b.jmx ./results/b svc-b 10 900 --service svc-b &
 wait
 
 # 场景 2：A 调用 B → 一次压测，A、B 画在同一批图里（一份 CSV、两条线）
-gputest run ./a.jmx ./result svc-a 10 900 --service fs --monitor-containers svc-a,svc-b
+gputest run ./a.jmx ./result svc-a 10 900 --service svc-a --monitor-containers svc-a,svc-b
 ```
 
 - 每轮 = 每个容器一条 `docker top` + **共享**两条 `nvidia-smi`，各容器数据同一时刻；峰值标注写明是哪个容器。
