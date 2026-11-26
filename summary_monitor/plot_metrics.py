@@ -37,8 +37,47 @@ def _escape(value):
     return html.escape(str(value), quote=True)
 
 
-def _fmt(value):
-    return format(value, ".6g")
+def _fixed_sig(value, digits):
+    """Format with ``digits`` significant figures, but never in exponent form."""
+    text = format(value, "." + str(digits) + "g")
+    marker = text.find("e")
+    if marker >= 0:
+        exponent = int(text[marker + 1:])
+        decimals = max(0, digits - 1 - exponent)
+        text = format(value, "." + str(decimals) + "f")
+    return "0" if text.startswith("-") and float(text) == 0 else text
+
+
+def _y_tick_labels(values, unit):
+    """Label y ticks with 2 significant figures, adding digits only to stay distinct."""
+    for digits in (2, 3, 4, 5):
+        labels = [_fixed_sig(value, digits) for value in values]
+        if len(set(labels)) == len(labels):
+            break
+    suffix = "%" if unit == "%" else ""
+    return [label + suffix for label in labels]
+
+
+def _fmt_minutes(seconds, span_seconds=None):
+    """Format an elapsed time (seconds) as a plain decimal minute tick label.
+
+    The first sample rarely lands on exactly 0 s, so the leftmost tick can be a
+    value like 1.6e-4 s. Anything that small relative to the axis span is
+    labelled ``0``; every other value stays in plain decimals so the axis never
+    falls back to scientific notation.
+    """
+    minutes = seconds / 60.0
+    if span_seconds is not None and abs(seconds) < abs(span_seconds) / 2000.0:
+        return "0"
+    magnitude = abs(minutes)
+    if magnitude == 0:
+        return "0"
+    if magnitude >= 100:
+        return format(minutes, ".0f")
+    if magnitude >= 1:
+        return format(minutes, ".1f").rstrip("0").rstrip(".")
+    decimals = min(9, 2 - int(math.floor(math.log10(magnitude))))
+    return format(minutes, "." + str(decimals) + "f").rstrip("0").rstrip(".")
 
 
 def _reduce(points, xmin, xmax, pixels):
@@ -107,23 +146,25 @@ def _panel(rows, metric, containers, yoffset=0):
                      f'{_escape(", ".join(containers) or "(none)")}</text>')
     if values:
         peak = max((row for row in rows if row[column] is not None), key=lambda row: row[column])
-        peak_text = f'Peak: {_fmt(peak[column])} {unit} at {peak["timestamp"] or "unknown time"} | container: {peak["container"]}'
+        peak_text = (f'Peak: {_fixed_sig(peak[column], 2)} {unit} at {peak["timestamp"] or "unknown time"}'
+                     f' | container: {peak["container"]}')
     else:
         peak_text = "No valid samples (No valid data)"
     parts.append(f'<text x="{LEFT}" y="65" font-size="12">{_escape(peak_text)}</text>')
     parts.append(f'<text x="{LEFT}" y="80" font-size="11">Valid samples: {len(values)} | Missing samples: {len(rows) - len(values)}</text>')
-    for i in range(5):
+    y_values = [((low * (1 - i / 4) + high * (i / 4))) * yscale for i in range(5)]
+    y_labels = _y_tick_labels(y_values, unit)
+    for i, tick_label in enumerate(y_labels):
         fraction = i / 4
         y = TOP + plot_height * (1 - fraction)
-        value = (low * (1 - fraction) + high * fraction) * yscale
-        tick_label = _fmt(value) + ('%' if unit == '%' else '')
         parts.extend((f'<path d="M{LEFT},{y:.2f} H{WIDTH - RIGHT}" stroke="#e2e8f0"/>',
                       f'<text x="{LEFT - 9}" y="{y + 4:.2f}" text-anchor="end" font-size="11">{_escape(tick_label)}</text>'))
         x = LEFT + plot_width * fraction
         tick = (xlow * (1 - fraction) + xhigh * fraction) * xscale
-        parts.append(f'<text x="{x:.2f}" y="{TOP + plot_height + 20}" text-anchor="middle" font-size="11">{_escape(_fmt(tick))}</text>')
+        tick_text = _fmt_minutes(tick, abs(xmax - xmin))
+        parts.append(f'<text x="{x:.2f}" y="{TOP + plot_height + 20}" text-anchor="middle" font-size="11">{_escape(tick_text)}</text>')
     parts.extend((f'<path d="M{LEFT},{TOP} V{TOP + plot_height} H{WIDTH - RIGHT}" fill="none" stroke="#64748b"/>',
-                  f'<text x="{LEFT + plot_width / 2}" y="{HEIGHT - 9}" text-anchor="middle" font-size="12">Elapsed time (s)</text>'))
+                  f'<text x="{LEFT + plot_width / 2}" y="{HEIGHT - 9}" text-anchor="middle" font-size="12">Elapsed time (min)</text>'))
     for index_c, container in enumerate(containers):
         line_color = color if not multi else palette[index_c % len(palette)]
         points = []
@@ -159,7 +200,8 @@ def _panel(rows, metric, containers, yoffset=0):
         anchor = "end" if float(x) > WIDTH - RIGHT - 65 else "start"
         label_y = float(y) + 18 if float(y) < TOP + plot_height - 25 else float(y) - 12
         tooltip = (f'Peak {label}: {peak[column]} {unit} | timestamp: {peak["timestamp"] or "unknown time"}'
-                   f' | elapsed_s: {peak["elapsed_s"]} | container: {peak["container"]}')
+                   f' | elapsed: {_fmt_minutes(peak["elapsed_s"])} min ({peak["elapsed_s"]} s)'
+                   f' | container: {peak["container"]}')
         parts.extend((f'<g class="peak-marker" aria-label="Peak {_escape(label)}">',
                       f'<title>{_escape(tooltip)}</title>',
                       f'<path d="M{x},{y} V{TOP + plot_height}" stroke="#dc2626" stroke-dasharray="4 4"/>',
