@@ -146,7 +146,9 @@ def _panel(rows, metric, containers, yoffset=0):
                      f'{_escape(", ".join(containers) or "(none)")}</text>')
     if values:
         peak = max((row for row in rows if row[column] is not None), key=lambda row: row[column])
-        peak_text = (f'Peak: {_fixed_sig(peak[column], 2)} {unit} at {peak["timestamp"] or "unknown time"}'
+        # Peak caption keeps 4 significant figures; integer-sized values stay exact,
+        # while the axis ticks above are rounded to 2 significant figures.
+        peak_text = (f'Peak: {_fixed_sig(peak[column], 4)} {unit} at {peak["timestamp"] or "unknown time"}'
                      f' | container: {peak["container"]}')
     else:
         peak_text = "No valid samples (No valid data)"
