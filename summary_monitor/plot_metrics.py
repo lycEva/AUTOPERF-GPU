@@ -177,19 +177,50 @@ def _svg(panels, height):
             + "\n".join(panels) + '\n</svg>\n')
 
 
+def _library_candidates(name):
+    """Ordered dlopen candidates for a system library, best first.
+
+    ``ctypes.util.find_library`` is not trustworthy on every interpreter: conda
+    environments ship a ``lib/<name>`` *directory* (``lib/glib-2.0`` only holds
+    headers) and some pythons hand that path back, which dlopen rejects with
+    "cannot read file data: Is a directory". Only a real file, or a bare soname
+    without a directory part, is accepted; otherwise the plain sonames below let
+    the dynamic loader search its own cache.
+    """
+    import ctypes.util
+    import os
+    found = ctypes.util.find_library(name)
+    usable = bool(found) and (os.path.isfile(found) or os.path.dirname(found) == '')
+    candidates = [found] if usable else []
+    for suffix in ('.so.0', '.so.2', '.so', ''):
+        candidate = 'lib' + name + suffix
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _load_library(name):
+    """Return a CDLL for a system library, or raise the documented error."""
+    import ctypes as c
+    attempts = []
+    for candidate in _library_candidates(name):
+        try:
+            return c.CDLL(candidate)
+        except OSError as exc:
+            attempts.append('{} ({})'.format(candidate, exc))
+    raise RuntimeError('PNG output requires system librsvg/Cairo; missing ' + name
+                       + ' (install librsvg2/cairo; this tool only writes PNG charts)'
+                       + '; tried ' + ', '.join(attempts))
+
+
 def _png_backend():
     """Bind installed librsvg/Cairo; no pip package or external command needed."""
     import ctypes as c
-    import ctypes.util
     if hasattr(_png_backend, 'cached'):
         return _png_backend.cached
     libraries = {}
     for name in ('rsvg-2', 'cairo', 'gobject-2.0', 'glib-2.0'):
-        filename = ctypes.util.find_library(name)
-        if not filename:
-            raise RuntimeError('PNG output requires system librsvg/Cairo; missing ' + name
-                               + ' (install librsvg2/cairo; this tool only writes PNG charts)')
-        libraries[name] = c.CDLL(filename)
+        libraries[name] = _load_library(name)
     rsvg, cairo = libraries['rsvg-2'], libraries['cairo']
     signatures = [
         (rsvg.rsvg_handle_new_from_data, c.c_void_p, [c.c_void_p, c.c_size_t, c.POINTER(c.c_void_p)]),
